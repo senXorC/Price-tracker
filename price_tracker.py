@@ -75,35 +75,63 @@ def fetch_oil() -> dict:
 
 # ── Lấy giá vàng trong nước (VN) ─────────────────────────────────────────────
 
-def _parse_sjc_data(data: list) -> dict:
-    """Parse JSON từ SJC API, tìm giá 1 lượng."""
-    for item in data:
-        name = str(item.get("n", "")).upper()
-        if any(k in name for k in ["1L", "LƯỢNG", "1 L"]):
-            return {
-                "buy":    float(item["pb"]) * 1_000,
-                "sell":   float(item["ps"]) * 1_000,
-                "unit":   "VND/lượng",
-                "source": "SJC",
-                "name":   item.get("n", "SJC 1L"),
-            }
-    item = data[0]
-    return {
-        "buy":    float(item["pb"]) * 1_000,
-        "sell":   float(item["ps"]) * 1_000,
-        "unit":   "VND/lượng",
-        "source": "SJC",
-        "name":   item.get("n", "SJC"),
-    }
-
-
 def fetch_gold_sjc() -> dict:
     """
-    Lấy giá vàng SJC/BTMC trong nước. Thử 4 nguồn theo thứ tự.
-    Không quy đổi từ giá TG — lấy giá thực tế thị trường VN.
+    Lấy giá vàng SJC thực tế thị trường VN. Thử 3 nguồn theo thứ tự:
+      1. VNAppMob API (api.vnappmob.com) — cần VNAPPMOB_API_KEY trong env
+      2. SJC XML feed (sjc.com.vn/xml/tygiavang.xml) — không cần key
+      3. SJC JSON API (sjc.com.vn/GoldPrice/...) — có thể bị 403
+    Không quy đổi từ giá TG.
     """
+    api_key = os.environ.get("VNAPPMOB_API_KEY", "")
 
-    # ── Nguồn 1: SJC chính thức ──────────────────────────────────────────────
+    # ── Nguồn 1: VNAppMob API — SJC chính xác, có key ────────────────────────
+    if api_key:
+        try:
+            r = requests.get(
+                "https://api.vnappmob.com/api/v2/gold/sjc",
+                headers={**HEADERS, "Authorization": f"Bearer {api_key}"},
+                timeout=15,
+            )
+            r.raise_for_status()
+            data = r.json()
+            item = data["results"][0]
+            buy  = float(item.get("buy_1l") or item.get("buy_hcm") or 0)
+            sell = float(item.get("sell_1l") or item.get("sell_hcm") or 0)
+            if buy > 0 and sell > 0:
+                log.info(f"VNAppMob SJC: buy={buy}, sell={sell}")
+                return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC (VNAppMob)", "name": "Vàng SJC 1 lượng"}
+        except Exception as e:
+            log.warning(f"Nguồn 1 VNAppMob: {e}")
+    else:
+        log.warning("Không có VNAPPMOB_API_KEY — bỏ qua nguồn 1")
+
+    # ── Nguồn 2: SJC XML feed — ổn định, không cần key ───────────────────────
+    try:
+        import xml.etree.ElementTree as ET
+        r = requests.get(
+            "https://sjc.com.vn/xml/tygiavang.xml",
+            headers={**HEADERS, "Referer": "https://sjc.com.vn/"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        # Tìm item SJC 1 lượng (n_1 chứa "SJC" hoặc "VÀNG MIẾNG")
+        for item in root.findall(".//Data"):
+            name = (item.get("n_1") or "").upper()
+            if "SJC" in name or "MIẾNG" in name:
+                buy  = float(item.get("pb_1", "0"))
+                sell = float(item.get("ps_1", "0"))
+                # XML trả về đơn vị nghìn đồng
+                if buy < 100_000:
+                    buy  *= 1_000
+                    sell *= 1_000
+                log.info(f"SJC XML: buy={buy}, sell={sell}")
+                return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC XML", "name": item.get("n_1", "SJC")}
+    except Exception as e:
+        log.warning(f"Nguồn 2 SJC XML: {e}")
+
+    # ── Nguồn 3: SJC JSON API (có thể bị 403) ────────────────────────────────
     try:
         r = requests.get(
             "https://sjc.com.vn/GoldPrice/Services/PriceService.ashx",
@@ -111,83 +139,18 @@ def fetch_gold_sjc() -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        return _parse_sjc_data(r.json())
-    except Exception as e:
-        log.warning(f"Nguồn 1 SJC API: {e}")
-
-    # ── Nguồn 2: BTMC (Bảo Tín Minh Châu) — có API public ───────────────────
-    try:
-        r = requests.get(
-            "https://btmc.vn/api/BTMCAPI/getpricebtmc?key=3kd8ub1llcg9t45hnoh8hmn7t5kc2v",
-            headers=HEADERS,
-            timeout=15,
-        )
-        r.raise_for_status()
         data = r.json()
-        # BTMC trả về list, tìm SJC 1L hoặc vàng miếng
-        items = data.get("DataList", {}).get("Data", [])
-        for item in items:
-            ktype = str(item.get("KLoai", "")).upper()
-            if "SJC" in ktype or "MIẾNG" in ktype or "1L" in ktype:
-                buy  = float(str(item.get("MuaVao",  "0")).replace(",", "").replace(".", ""))
-                sell = float(str(item.get("BanRa",   "0")).replace(",", "").replace(".", ""))
-                if buy > 1_000_000:   # đơn vị VND (không phải nghìn đồng)
-                    return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "BTMC", "name": item.get("KLoai")}
-                elif buy > 1_000:     # đơn vị nghìn đồng
-                    return {"buy": buy * 1_000, "sell": sell * 1_000, "unit": "VND/lượng", "source": "BTMC", "name": item.get("KLoai")}
+        for item in data:
+            name = str(item.get("n", "")).upper()
+            if any(k in name for k in ["1L", "LƯỢNG", "1 L"]):
+                buy  = float(item["pb"]) * 1_000
+                sell = float(item["ps"]) * 1_000
+                log.info(f"SJC JSON: buy={buy}, sell={sell}")
+                return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC", "name": item.get("n", "SJC 1L")}
     except Exception as e:
-        log.warning(f"Nguồn 2 BTMC: {e}")
+        log.warning(f"Nguồn 3 SJC JSON: {e}")
 
-    # ── Nguồn 3: PNJ — scrape JSON từ trang giá vàng ─────────────────────────
-    try:
-        r = requests.get(
-            "https://www.pnj.com.vn/blog/gia-vang/",
-            headers={**HEADERS, "Referer": "https://www.pnj.com.vn/"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        import re
-        # PNJ nhúng giá trong JSON trong thẻ script
-        match = re.search(r'"SJC[^"]*"[^}]*"buy"\s*:\s*"?([\d,\.]+)"?[^}]*"sell"\s*:\s*"?([\d,\.]+)"?', r.text, re.IGNORECASE)
-        if not match:
-            # Thử pattern khác: tìm số lớn ~120,000,000 trong bảng giá
-            match = re.search(r'(1[12]\d[,\.\d]+)\s*[|/–-]\s*(1[12]\d[,\.\d]+)', r.text)
-        if match:
-            buy  = float(match.group(1).replace(",", "").replace(".", ""))
-            sell = float(match.group(2).replace(",", "").replace(".", ""))
-            # Chuẩn hoá về VND (nếu đơn vị triệu)
-            if buy < 10_000:
-                buy *= 1_000_000; sell *= 1_000_000
-            elif buy < 10_000_000:
-                buy *= 1_000; sell *= 1_000
-            return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "PNJ", "name": "Vàng SJC (PNJ)"}
-    except Exception as e:
-        log.warning(f"Nguồn 3 PNJ: {e}")
-
-    # ── Nguồn 4: giavang.net JSON feed ───────────────────────────────────────
-    try:
-        r = requests.get(
-            "https://www.giavang.net/ajaxprice.aspx",
-            headers={**HEADERS, "Referer": "https://www.giavang.net/", "X-Requested-With": "XMLHttpRequest"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        import re
-        # Tìm giá SJC dạng "SJC|buy|sell" hoặc JSON
-        text = r.text
-        match = re.search(r'SJC[^0-9]*([\d,]+)[^0-9]+([\d,]+)', text, re.IGNORECASE)
-        if match:
-            buy  = float(match.group(1).replace(",", ""))
-            sell = float(match.group(2).replace(",", ""))
-            if buy < 10_000:
-                buy *= 1_000_000; sell *= 1_000_000
-            elif buy < 10_000_000:
-                buy *= 1_000; sell *= 1_000
-            return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "giavang.net", "name": "Vàng SJC"}
-    except Exception as e:
-        log.warning(f"Nguồn 4 giavang.net: {e}")
-
-    raise RuntimeError("Tất cả 4 nguồn giá vàng VN đều thất bại")
+    raise RuntimeError("Tất cả 3 nguồn giá vàng VN đều thất bại")
 
 
 # ── Lịch sử giá ───────────────────────────────────────────────────────────────
