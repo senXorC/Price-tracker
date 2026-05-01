@@ -73,63 +73,121 @@ def fetch_oil() -> dict:
     return fetch_yahoo("CL%3DF", "Dầu WTI (USD/thùng)")
 
 
-# ── Lấy giá vàng SJC ─────────────────────────────────────────────────────────
+# ── Lấy giá vàng trong nước (VN) ─────────────────────────────────────────────
+
+def _parse_sjc_data(data: list) -> dict:
+    """Parse JSON từ SJC API, tìm giá 1 lượng."""
+    for item in data:
+        name = str(item.get("n", "")).upper()
+        if any(k in name for k in ["1L", "LƯỢNG", "1 L"]):
+            return {
+                "buy":    float(item["pb"]) * 1_000,
+                "sell":   float(item["ps"]) * 1_000,
+                "unit":   "VND/lượng",
+                "source": "SJC",
+                "name":   item.get("n", "SJC 1L"),
+            }
+    item = data[0]
+    return {
+        "buy":    float(item["pb"]) * 1_000,
+        "sell":   float(item["ps"]) * 1_000,
+        "unit":   "VND/lượng",
+        "source": "SJC",
+        "name":   item.get("n", "SJC"),
+    }
+
 
 def fetch_gold_sjc() -> dict:
     """
-    Lấy giá vàng SJC. Thử nhiều endpoint theo thứ tự ưu tiên.
+    Lấy giá vàng SJC/BTMC trong nước. Thử 4 nguồn theo thứ tự.
+    Không quy đổi từ giá TG — lấy giá thực tế thị trường VN.
     """
-    # Phương án 1: API JSON chính thức SJC (thêm headers browser đầy đủ)
+
+    # ── Nguồn 1: SJC chính thức ──────────────────────────────────────────────
     try:
-        url = "https://sjc.com.vn/GoldPrice/Services/PriceService.ashx"
-        headers = {
-            **HEADERS,
-            "Referer": "https://sjc.com.vn/",
-            "Origin": "https://sjc.com.vn",
-        }
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(
+            "https://sjc.com.vn/GoldPrice/Services/PriceService.ashx",
+            headers={**HEADERS, "Referer": "https://sjc.com.vn/", "Origin": "https://sjc.com.vn"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return _parse_sjc_data(r.json())
+    except Exception as e:
+        log.warning(f"Nguồn 1 SJC API: {e}")
+
+    # ── Nguồn 2: BTMC (Bảo Tín Minh Châu) — có API public ───────────────────
+    try:
+        r = requests.get(
+            "https://btmc.vn/api/BTMCAPI/getpricebtmc?key=3kd8ub1llcg9t45hnoh8hmn7t5kc2v",
+            headers=HEADERS,
+            timeout=15,
+        )
         r.raise_for_status()
         data = r.json()
-        # Tìm SJC 1 lượng
-        for item in data:
-            name = str(item.get("n", "")).upper()
-            if any(k in name for k in ["1L", "LƯỢNG", "1 L"]):
-                return {
-                    "buy":    float(item["pb"]) * 1_000,
-                    "sell":   float(item["ps"]) * 1_000,
-                    "unit":   "VND/lượng",
-                    "source": "SJC",
-                    "name":   item.get("n", "SJC 1L"),
-                }
-        # Fallback: item đầu tiên
-        item = data[0]
-        return {
-            "buy":    float(item["pb"]) * 1_000,
-            "sell":   float(item["ps"]) * 1_000,
-            "unit":   "VND/lượng",
-            "source": "SJC",
-            "name":   item.get("n", "SJC"),
-        }
+        # BTMC trả về list, tìm SJC 1L hoặc vàng miếng
+        items = data.get("DataList", {}).get("Data", [])
+        for item in items:
+            ktype = str(item.get("KLoai", "")).upper()
+            if "SJC" in ktype or "MIẾNG" in ktype or "1L" in ktype:
+                buy  = float(str(item.get("MuaVao",  "0")).replace(",", "").replace(".", ""))
+                sell = float(str(item.get("BanRa",   "0")).replace(",", "").replace(".", ""))
+                if buy > 1_000_000:   # đơn vị VND (không phải nghìn đồng)
+                    return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "BTMC", "name": item.get("KLoai")}
+                elif buy > 1_000:     # đơn vị nghìn đồng
+                    return {"buy": buy * 1_000, "sell": sell * 1_000, "unit": "VND/lượng", "source": "BTMC", "name": item.get("KLoai")}
     except Exception as e:
-        log.warning(f"SJC API thất bại: {e}")
+        log.warning(f"Nguồn 2 BTMC: {e}")
 
-    # Phương án 2: Tính từ vàng TG + tỷ giá USD (ước tính)
+    # ── Nguồn 3: PNJ — scrape JSON từ trang giá vàng ─────────────────────────
     try:
-        gold_world = fetch_gold_world()
-        usd_vnd    = fetch_usd_vnd()
-        # Công thức: giá vàng SJC ≈ XAU/USD × USD/VND / 26.267 (oz/lượng) + phụ phí ~5%
-        oz_per_luong = 26.267 / 8  # 1 lượng = 37.5g, 1 oz = 31.1g
-        base = gold_world["price"] * usd_vnd["price"] * oz_per_luong
-        return {
-            "buy":    round(base * 0.995 / 1000) * 1000,
-            "sell":   round(base * 1.005 / 1000) * 1000,
-            "unit":   "VND/lượng",
-            "source": "Ước tính (XAU×USD/VND)",
-            "name":   "Vàng TG quy đổi",
-            "estimated": True,
-        }
+        r = requests.get(
+            "https://www.pnj.com.vn/blog/gia-vang/",
+            headers={**HEADERS, "Referer": "https://www.pnj.com.vn/"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        import re
+        # PNJ nhúng giá trong JSON trong thẻ script
+        match = re.search(r'"SJC[^"]*"[^}]*"buy"\s*:\s*"?([\d,\.]+)"?[^}]*"sell"\s*:\s*"?([\d,\.]+)"?', r.text, re.IGNORECASE)
+        if not match:
+            # Thử pattern khác: tìm số lớn ~120,000,000 trong bảng giá
+            match = re.search(r'(1[12]\d[,\.\d]+)\s*[|/–-]\s*(1[12]\d[,\.\d]+)', r.text)
+        if match:
+            buy  = float(match.group(1).replace(",", "").replace(".", ""))
+            sell = float(match.group(2).replace(",", "").replace(".", ""))
+            # Chuẩn hoá về VND (nếu đơn vị triệu)
+            if buy < 10_000:
+                buy *= 1_000_000; sell *= 1_000_000
+            elif buy < 10_000_000:
+                buy *= 1_000; sell *= 1_000
+            return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "PNJ", "name": "Vàng SJC (PNJ)"}
     except Exception as e:
-        raise RuntimeError(f"Không lấy được giá vàng SJC: {e}")
+        log.warning(f"Nguồn 3 PNJ: {e}")
+
+    # ── Nguồn 4: giavang.net JSON feed ───────────────────────────────────────
+    try:
+        r = requests.get(
+            "https://www.giavang.net/ajaxprice.aspx",
+            headers={**HEADERS, "Referer": "https://www.giavang.net/", "X-Requested-With": "XMLHttpRequest"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        import re
+        # Tìm giá SJC dạng "SJC|buy|sell" hoặc JSON
+        text = r.text
+        match = re.search(r'SJC[^0-9]*([\d,]+)[^0-9]+([\d,]+)', text, re.IGNORECASE)
+        if match:
+            buy  = float(match.group(1).replace(",", ""))
+            sell = float(match.group(2).replace(",", ""))
+            if buy < 10_000:
+                buy *= 1_000_000; sell *= 1_000_000
+            elif buy < 10_000_000:
+                buy *= 1_000; sell *= 1_000
+            return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "giavang.net", "name": "Vàng SJC"}
+    except Exception as e:
+        log.warning(f"Nguồn 4 giavang.net: {e}")
+
+    raise RuntimeError("Tất cả 4 nguồn giá vàng VN đều thất bại")
 
 
 # ── Lịch sử giá ───────────────────────────────────────────────────────────────
