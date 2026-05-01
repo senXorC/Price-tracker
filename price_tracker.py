@@ -75,17 +75,64 @@ def fetch_oil() -> dict:
 
 # ── Lấy giá vàng trong nước (VN) ─────────────────────────────────────────────
 
+# ── Lấy giá vàng trong nước (VN) ─────────────────────────────────────────────
+
 def fetch_gold_sjc() -> dict:
     """
-    Lấy giá vàng SJC thực tế thị trường VN. Thử 3 nguồn theo thứ tự:
-      1. VNAppMob API (api.vnappmob.com) — cần VNAPPMOB_API_KEY trong env
-      2. SJC XML feed (sjc.com.vn/xml/tygiavang.xml) — không cần key
-      3. SJC JSON API (sjc.com.vn/GoldPrice/...) — có thể bị 403
-    Không quy đổi từ giá TG.
+    Lấy giá vàng SJC thực tế thị trường VN.
+    Dùng webgia.com và webtygia.com — các trang tổng hợp không block GitHub Actions IP.
+    SJC trực tiếp block IP nước ngoài nên không dùng.
     """
-    api_key = os.environ.get("VNAPPMOB_API_KEY", "")
 
-    # ── Nguồn 1: VNAppMob API — SJC chính xác, có key ────────────────────────
+    # ── Nguồn 1: webgia.com — scrape bảng giá vàng ───────────────────────────
+    try:
+        from bs4 import BeautifulSoup
+        r = requests.get(
+            "https://webgia.com/gia-vang/",
+            headers={**HEADERS, "Referer": "https://webgia.com/"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "lxml")
+
+        # Tìm bảng giá vàng SJC
+        for row in soup.select("table tr"):
+            cells = row.find_all(["td", "th"])
+            text  = " ".join(c.get_text(strip=True) for c in cells).upper()
+            if "SJC" in text and len(cells) >= 3:
+                nums = []
+                for c in cells:
+                    t = c.get_text(strip=True).replace(",", "").replace(".", "")
+                    if t.isdigit() and len(t) >= 7:
+                        nums.append(float(t))
+                if len(nums) >= 2:
+                    log.info(f"webgia.com SJC: buy={nums[0]}, sell={nums[1]}")
+                    return {"buy": nums[0], "sell": nums[1], "unit": "VND/lượng", "source": "webgia.com", "name": "Vàng SJC"}
+    except Exception as e:
+        log.warning(f"Nguồn 1 webgia.com: {e}")
+
+    # ── Nguồn 2: webtygia.com JSON API ───────────────────────────────────────
+    try:
+        r = requests.get(
+            "https://webtygia.com/api/gold",
+            headers=HEADERS,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for item in (data if isinstance(data, list) else data.get("data", [])):
+            name = str(item.get("name", "") or item.get("loai", "")).upper()
+            if "SJC" in name or "MIẾNG" in name:
+                buy  = float(str(item.get("buy")  or item.get("mua", 0)).replace(",", ""))
+                sell = float(str(item.get("sell") or item.get("ban", 0)).replace(",", ""))
+                if buy > 1_000_000:
+                    log.info(f"webtygia.com SJC: buy={buy}, sell={sell}")
+                    return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "webtygia.com", "name": "Vàng SJC"}
+    except Exception as e:
+        log.warning(f"Nguồn 2 webtygia.com: {e}")
+
+    # ── Nguồn 3: VNAppMob (nếu có key còn hạn) ───────────────────────────────
+    api_key = os.environ.get("VNAPPMOB_API_KEY", "")
     if api_key:
         try:
             r = requests.get(
@@ -94,19 +141,16 @@ def fetch_gold_sjc() -> dict:
                 timeout=15,
             )
             r.raise_for_status()
-            data = r.json()
-            item = data["results"][0]
+            item = r.json()["results"][0]
             buy  = float(item.get("buy_1l") or item.get("buy_hcm") or 0)
             sell = float(item.get("sell_1l") or item.get("sell_hcm") or 0)
-            if buy > 0 and sell > 0:
+            if buy > 0:
                 log.info(f"VNAppMob SJC: buy={buy}, sell={sell}")
                 return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC (VNAppMob)", "name": "Vàng SJC 1 lượng"}
         except Exception as e:
-            log.warning(f"Nguồn 1 VNAppMob: {e}")
-    else:
-        log.warning("Không có VNAPPMOB_API_KEY — bỏ qua nguồn 1")
+            log.warning(f"Nguồn 3 VNAppMob: {e}")
 
-    # ── Nguồn 2: SJC XML feed — ổn định, không cần key ───────────────────────
+    # ── Nguồn 4: SJC XML (có thể bị block từ IP nước ngoài) ──────────────────
     try:
         import xml.etree.ElementTree as ET
         r = requests.get(
@@ -116,41 +160,19 @@ def fetch_gold_sjc() -> dict:
         )
         r.raise_for_status()
         root = ET.fromstring(r.content)
-        # Tìm item SJC 1 lượng (n_1 chứa "SJC" hoặc "VÀNG MIẾNG")
         for item in root.findall(".//Data"):
             name = (item.get("n_1") or "").upper()
             if "SJC" in name or "MIẾNG" in name:
                 buy  = float(item.get("pb_1", "0"))
                 sell = float(item.get("ps_1", "0"))
-                # XML trả về đơn vị nghìn đồng
                 if buy < 100_000:
-                    buy  *= 1_000
-                    sell *= 1_000
+                    buy *= 1_000; sell *= 1_000
                 log.info(f"SJC XML: buy={buy}, sell={sell}")
                 return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC XML", "name": item.get("n_1", "SJC")}
     except Exception as e:
-        log.warning(f"Nguồn 2 SJC XML: {e}")
+        log.warning(f"Nguồn 4 SJC XML: {e}")
 
-    # ── Nguồn 3: SJC JSON API (có thể bị 403) ────────────────────────────────
-    try:
-        r = requests.get(
-            "https://sjc.com.vn/GoldPrice/Services/PriceService.ashx",
-            headers={**HEADERS, "Referer": "https://sjc.com.vn/", "Origin": "https://sjc.com.vn"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        data = r.json()
-        for item in data:
-            name = str(item.get("n", "")).upper()
-            if any(k in name for k in ["1L", "LƯỢNG", "1 L"]):
-                buy  = float(item["pb"]) * 1_000
-                sell = float(item["ps"]) * 1_000
-                log.info(f"SJC JSON: buy={buy}, sell={sell}")
-                return {"buy": buy, "sell": sell, "unit": "VND/lượng", "source": "SJC", "name": item.get("n", "SJC 1L")}
-    except Exception as e:
-        log.warning(f"Nguồn 3 SJC JSON: {e}")
-
-    raise RuntimeError("Tất cả 3 nguồn giá vàng VN đều thất bại")
+    raise RuntimeError("Tất cả nguồn giá vàng VN đều thất bại")
 
 
 # ── Lịch sử giá ───────────────────────────────────────────────────────────────
