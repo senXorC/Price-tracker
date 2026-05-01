@@ -1,0 +1,81 @@
+name: Price Tracker - Theo dõi giá & cảnh báo Telegram
+
+on:
+  # Chạy định kỳ: mỗi ngày 8h sáng, 12h trưa, 5h chiều (ICT = UTC+7)
+  schedule:
+    - cron: "0 1 * * *"    # 08:00 ICT — báo cáo sáng
+    - cron: "0 5 * * *"    # 12:00 ICT — báo cáo trưa
+    - cron: "0 10 * * *"   # 17:00 ICT — báo cáo chiều
+    # Kiểm tra cảnh báo biến động mỗi 30 phút trong giờ giao dịch
+    - cron: "*/30 1-10 * * 1-5"   # 08:00–17:00 ICT, thứ 2–6
+
+  # Cho phép chạy thủ công từ GitHub UI
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Chế độ chạy"
+        required: true
+        default: "report"
+        type: choice
+        options:
+          - report        # Gửi báo cáo đầy đủ
+          - alert_only    # Chỉ gửi khi biến động vượt ngưỡng
+
+jobs:
+  track-prices:
+    name: Lấy giá & gửi Telegram
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Cache lịch sử giá giữa các lần chạy
+      - name: Restore price history cache
+        uses: actions/cache@v4
+        with:
+          path: price_history.json
+          key: price-history-${{ runner.os }}
+          restore-keys: |
+            price-history-
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Xác định RUN_MODE: scheduled 8h/12h/17h → report, còn lại → alert_only
+      - name: Set run mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+          else
+            HOUR=$(date -u +%H)
+            if [ "$HOUR" = "01" ] || [ "$HOUR" = "05" ] || [ "$HOUR" = "10" ]; then
+              echo "mode=report" >> $GITHUB_OUTPUT
+            else
+              echo "mode=alert_only" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run price tracker
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALERT_THRESHOLD: ${{ vars.ALERT_THRESHOLD || '5.0' }}
+          RUN_MODE: ${{ steps.mode.outputs.mode }}
+        run: python price_tracker.py
+
+      # Lưu lịch sử giá để lần sau so sánh
+      - name: Save price history cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: price_history.json
+          key: price-history-${{ runner.os }}-${{ github.run_id }}
